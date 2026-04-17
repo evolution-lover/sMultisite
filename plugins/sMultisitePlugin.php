@@ -23,6 +23,7 @@
 use EvolutionCMS\Facades\UrlProcessor;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Schema;
 use Seiger\sCommerce\Facades\sCommerce;
 use Seiger\sMultisite\Facades\sMultisite;
 
@@ -50,128 +51,6 @@ if (!function_exists('ms_sso_load_functions')) {
     }
 }
 
-if (!function_exists('ms_sso_resolve_start_url')) {
-    /**
-     * Resolve and consume pending SSO run (login/logout), returning the first redirect URL.
-     *
-     * @return string
-     */
-    function ms_sso_resolve_start_url(): string {
-        static $dispatchedInRequest = false;
-        if ($dispatchedInRequest) {
-            return '';
-        }
-
-        ms_sso_load_functions();
-
-        if (session_status() !== PHP_SESSION_ACTIVE) {
-            @session_start();
-        }
-
-        $loginRun = $_SESSION['ms_run_login'] ?? null;
-        $logoutRun = $_COOKIE['ms_run_logout'] ?? null;
-        if (!$loginRun && !$logoutRun) {
-            return '';
-        }
-
-        // Parallel manager requests can race and dispatch the same run twice.
-        if ($loginRun && !ms_run_claim_start((string)$loginRun, 30)) {
-            unset($_SESSION['ms_run_login']);
-            $loginRun = null;
-        }
-        if ($logoutRun && !ms_run_claim_start((string)$logoutRun, 30)) {
-            setcookie('ms_run_logout', '', time() - 3600, '/');
-            unset($_COOKIE['ms_run_logout']);
-            $logoutRun = null;
-        }
-        if (!$loginRun && !$logoutRun) {
-            return '';
-        }
-
-        // Login has priority. If both exist, drop stale logout run.
-        if ($loginRun && $logoutRun) {
-            ms_run_del((string)$logoutRun);
-            setcookie('ms_run_logout', '', time() - 3600, '/');
-            unset($_COOKIE['ms_run_logout']);
-            $logoutRun = null;
-        }
-
-        $suffix = (string)evo()->getConfig('friendly_url_suffix', '');
-        $isHttps = (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) === 'on')
-            || (($_SERVER['SERVER_PORT'] ?? 0) == 443)
-            || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
-        $scheme = $isHttps ? 'https' : 'http';
-        $finalReturn = $scheme . '://' . ($_SERVER['HTTP_HOST'] ?? '') . ($_SERVER['REQUEST_URI'] ?? '/manager/?a=2');
-
-        $startLoginUrl = '';
-        if ($loginRun) {
-            $run = ms_run_get((string)$loginRun);
-            if (is_array($run) && !empty($run['home']) && !empty($run['steps'][0])) {
-                $first = $run['steps'][0];
-                $return = $scheme . '://' . $run['home'] . '/_ms-run' . $suffix . '?run=' . $loginRun . '&i=1&ret=' . rawurlencode($finalReturn);
-                $startLoginUrl = $scheme . '://' . $first['host'] . '/_ms-sso' . $suffix . '?c=' . rawurlencode($first['code']) . '&return=' . rawurlencode($return);
-            } else {
-                error_log('[sMultisite SSO] START login run missing/invalid runId=' . (string)$loginRun);
-            }
-        }
-
-        $startLogoutUrl = '';
-        if ($logoutRun) {
-            $run = ms_run_get((string)$logoutRun);
-            if (is_array($run) && !empty($run['home']) && !empty($run['steps'][0])) {
-                $first = $run['steps'][0];
-                $return = $scheme . '://' . $run['home'] . '/_ms-run-logout' . $suffix . '?run=' . $logoutRun . '&i=1&ret=' . rawurlencode($finalReturn);
-                $startLogoutUrl = $scheme . '://' . $first['host'] . '/_ms-sso-logout' . $suffix . '?c=' . rawurlencode($first['code']) . '&return=' . rawurlencode($return);
-            } else {
-                error_log('[sMultisite SSO] START logout run missing/invalid runId=' . (string)$logoutRun);
-            }
-        }
-
-        unset($_SESSION['ms_run_login']);
-        if ($logoutRun) {
-            setcookie('ms_run_logout', '', time() - 3600, '/');
-        }
-
-        $start = $startLoginUrl ?: $startLogoutUrl;
-        if ($start !== '') {
-            $dispatchedInRequest = true;
-            error_log('[sMultisite SSO] START redirect=' . $start);
-        }
-
-        return $start;
-    }
-}
-
-if (!function_exists('ms_sso_current_session_id')) {
-    /**
-     * Resolve current canonical session ID used by middleware.
-     *
-     * Prefer Laravel session ID; fallback to native PHP session ID.
-     *
-     * @return string
-     */
-    function ms_sso_current_session_id(): string {
-        try {
-            if (function_exists('app')) {
-                $sessionManager = app('session');
-                $store = (is_object($sessionManager) && method_exists($sessionManager, 'driver'))
-                    ? $sessionManager->driver()
-                    : $sessionManager;
-                if (is_object($store) && method_exists($store, 'getId')) {
-                    $sid = (string)$store->getId();
-                    if ($sid !== '') {
-                        return $sid;
-                    }
-                }
-            }
-        } catch (\Throwable) {
-        }
-
-        $sid = (string)session_id();
-        return $sid;
-    }
-}
-
 /**
  * OnLoadSettings
  *
@@ -187,7 +66,10 @@ if (!function_exists('ms_sso_current_session_id')) {
  * @return void
  */
 Event::listen('evolution.OnLoadSettings', function($params) {
-    $host = $_SERVER['HTTP_HOST'];
+    if (!Schema::hasTable('s_multisites')) {
+        return;
+    }
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     if (isset($params['config']['setHost']) && trim($params['config']['setHost']) !== '') {
         $host = trim($params['config']['setHost']);
     }
@@ -245,7 +127,7 @@ Event::listen('evolution.OnWebPageInit', function () {
  * @return string|null Prefixed URL for Manager context, otherwise null to keep default behavior
  */
 Event::listen('evolution.OnMakeDocUrl', function($params) {
-    if (evo()->isBackend()) {
+    if (evo()->isBackend() && Schema::hasTable('s_multisites')) {
         $roots = evo()->getParentIds($params['id']);
         if (count($roots)) {
             $root = array_pop($roots);
@@ -349,15 +231,13 @@ Event::listen('evolution.OnManagerMenuPrerender', function($params) {
  * @return void
  */
 Event::listen('evolution.OnManagerLogin', function () {
+    if (!Schema::hasTable('s_multisites')) return;
     ms_sso_load_functions();
 
     if (session_status() !== PHP_SESSION_ACTIVE) @session_start();
     if (session_status() !== PHP_SESSION_ACTIVE) return;
 
-    $sid = ms_sso_current_session_id(); // Laravel session id (canonical for EVO_SESSION=true)
-    $nativeSid = (string)session_id(); // Native PHP session id (legacy fallback)
-    if ($sid === '' && $nativeSid === '') return;
-    $uid = (int)($_SESSION['mgrInternalKey'] ?? 0);
+    $sid = session_id(); if (!$sid) return;
     $home = strtolower(parse_url((($_SERVER['HTTPS']??'')==='on'?'https':'http').'://'.($_SERVER['HTTP_HOST']??''), PHP_URL_HOST));
 
     // Normalize host strings.
@@ -383,28 +263,15 @@ Event::listen('evolution.OnManagerLogin', function () {
 
     $steps = [];
     foreach ($targets as $host) {
-        $token = ms_sso_token_make([
-            'mode' => 'login',
-            'sid' => $sid,
-            'sid_native' => $nativeSid,
-            'uid' => $uid,
-            'host' => $host,
-        ], 180);
+        $token = ms_sso_token_make(['mode' => 'login', 'sid' => $sid, 'host' => $host], 180);
         $steps[] = ['host' => $host, 'code' => $token];
     }
 
     $runId = rtrim(strtr(base64_encode(random_bytes(12)), '+/', '-_'), '=');
     ms_run_put($runId, ['home' => $canon($home), 'steps' => $steps], 300);
 
-    error_log('[sMultisite SSO] LOGIN runId=' . $runId . ' steps_count=' . count($steps) . ' home=' . $canon($home) . ' sid=' . $sid . ' sid_native=' . $nativeSid . ' uid=' . $uid);
+    error_log('[sMultisite SSO] LOGIN runId=' . $runId . ' steps_count=' . count($steps) . ' home=' . $canon($home));
     $_SESSION['ms_run_login'] = $runId;
-
-    // Ensure stale logout run does not cancel fresh login propagation.
-    if (!empty($_COOKIE['ms_run_logout'])) {
-        ms_run_del((string)$_COOKIE['ms_run_logout']);
-        setcookie('ms_run_logout', '', time() - 3600, '/');
-        unset($_COOKIE['ms_run_logout']);
-    }
 });
 
 /**
@@ -420,6 +287,7 @@ Event::listen('evolution.OnManagerLogin', function () {
  * @return void
  */
 Event::listen('evolution.OnManagerLogout', function () {
+    if (!Schema::hasTable('s_multisites')) return;
     ms_sso_load_functions();
 
     $canon = function($h) {
@@ -464,7 +332,48 @@ Event::listen('evolution.OnManagerLogout', function () {
  * @return void
  */
 Event::listen('evolution.OnManagerWelcomeHome', function () {
-    $start = ms_sso_resolve_start_url();
+    ms_sso_load_functions();
+
+    if (session_status() !== PHP_SESSION_ACTIVE) @session_start();
+
+    $loginRun  = $_SESSION['ms_run_login']  ?? null;
+    $logoutRun = $_COOKIE['ms_run_logout'] ?? null;
+    if (!$loginRun && !$logoutRun) return;
+
+    $suffix = (string) evo()->getConfig('friendly_url_suffix', '');
+    $isHttps = (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) === 'on')
+        || (($_SERVER['SERVER_PORT'] ?? 0) == 443)
+        || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https');
+    $scheme = $isHttps ? 'https' : 'http';
+
+    // Where to return after SSO propagation completes
+    $finalReturn = $scheme . '://' . ($_SERVER['HTTP_HOST'] ?? '') . ($_SERVER['REQUEST_URI'] ?? '/manager/?a=2');
+
+    $startLoginUrl = '';
+    if ($loginRun) {
+        $run = ms_run_get($loginRun);
+        if (is_array($run) && !empty($run['home']) && !empty($run['steps'][0])) {
+            $first  = $run['steps'][0];
+            $return = $scheme . '://' . $run['home'] . '/_ms-run' . $suffix . '?run=' . $loginRun . '&i=1&ret=' . rawurlencode($finalReturn);
+            $startLoginUrl = 'https://' . $first['host'] . '/_ms-sso' . $suffix . '?c=' . rawurlencode($first['code']) . '&return=' . rawurlencode($return);
+        }
+    }
+
+    $startLogoutUrl = '';
+    if ($logoutRun) {
+        $run = ms_run_get($logoutRun);
+        if (is_array($run) && !empty($run['home']) && !empty($run['steps'][0])) {
+            $first  = $run['steps'][0];
+            $return = $scheme . '://' . $run['home'] . '/_ms-run-logout' . $suffix . '?run=' . $logoutRun . '&i=1&ret=' . rawurlencode($finalReturn);
+            $startLogoutUrl = 'https://' . $first['host'] . '/_ms-sso-logout' . $suffix . '?c=' . rawurlencode($first['code']) . '&return=' . rawurlencode($return);
+        }
+    }
+
+    // one-time use
+    unset($_SESSION['ms_run_login']);
+    if ($logoutRun) setcookie('ms_run_logout', '', time() - 3600, '/');
+
+    $start = $startLoginUrl ?: $startLogoutUrl;
     if (!$start) return;
 
     $jsStart = json_encode($start, JSON_UNESCAPED_SLASHES);
@@ -474,16 +383,6 @@ Event::listen('evolution.OnManagerWelcomeHome', function () {
 </div>
 <script>location.replace($jsStart);</script>
 HTML;
-});
-
-Event::listen('evolution.OnManagerMainFrameHeaderHTMLBlock', function () {
-    $start = ms_sso_resolve_start_url();
-    if (!$start) {
-        return '';
-    }
-
-    $jsStart = json_encode($start, JSON_UNESCAPED_SLASHES);
-    return "<script>if(!window.__msSsoStarted){window.__msSsoStarted=1;location.replace($jsStart);}</script>";
 });
 
 /**
@@ -529,26 +428,6 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
     $scheme = $https ? 'https' : 'http';
     $slow   = isset($_GET['slow']);
     $cookie = defined('SESSION_COOKIE_NAME') ? SESSION_COOKIE_NAME : session_name();
-    $laravelCookie = function_exists('config') ? (string)config('session.cookie', 'evo_session') : 'evo_session';
-    $sessionPath = function_exists('config') ? (string)config('session.path', '/') : '/';
-    $sessionDomain = function_exists('config') ? (string)(config('session.domain') ?? '') : '';
-    $sessionSecureCfg = function_exists('config') ? config('session.secure', null) : null;
-    $sessionSecure = is_bool($sessionSecureCfg) ? $sessionSecureCfg : $https;
-    $sessionSameSite = function_exists('config') ? strtolower((string)(config('session.same_site') ?? '')) : '';
-    if (!in_array($sessionSameSite, ['lax', 'strict', 'none'], true)) {
-        $sessionSameSite = 'lax';
-    }
-    $cookiePath = $sessionPath !== '' ? $sessionPath : '/';
-    $cookieSameSite = ucfirst($sessionSameSite);
-    $cookieOptionsBase = [
-        'path' => $cookiePath,
-        'secure' => $sessionSecure,
-        'httponly' => true,
-        'samesite' => $cookieSameSite,
-    ];
-    if ($sessionDomain !== '') {
-        $cookieOptionsBase['domain'] = $sessionDomain;
-    }
     $rootDom = getenv('MS_SESSION_ROOT_DOMAIN') ?: (function_exists('env') ? (string)env('MS_SESSION_ROOT_DOMAIN', '') : '');
 
     $noStore = static function () {
@@ -567,17 +446,6 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
         header('Content-Type: text/html; charset=UTF-8');
 
         if (!$run || empty($run['steps']) || empty($run['home'])) {
-            if ($ret !== '' || $i > 0) {
-                error_log('[sMultisite SSO] RUN login missing runId=' . $runId . ' i=' . $i . ' ret=' . $ret . ' host=' . ($_SERVER['HTTP_HOST'] ?? ''));
-                if ($ret !== '') {
-                    $jsRet = json_encode($ret, JSON_UNESCAPED_SLASHES);
-                    echo "<script>location.replace($jsRet);</script>";
-                    echo '<noscript><meta http-equiv="refresh" content="0;url=' . htmlspecialchars($ret, ENT_QUOTES) . '"></noscript>';
-                } else {
-                    echo "<h2>SMultisite SSO: Done ✔</h2><script>setTimeout(function(){window.close&&window.close();},400);</script>";
-                }
-                exit;
-            }
             echo "<h2>SMultisite SSO: Plan not found</h2>";
             exit;
         }
@@ -603,7 +471,7 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
         $next = "{$scheme}://{$home}/_ms-run{$suffix}?run=" . rawurlencode($runId) . "&i=" . ($i + 1)
             . ($ret !== '' ? '&ret=' . rawurlencode($ret) : '')
             . ($slow ? '&slow=1' : '');
-        $url  = "{$scheme}://{$step['host']}/_ms-sso{$suffix}?c=" . rawurlencode($step['code'])
+        $url  = "https://{$step['host']}/_ms-sso{$suffix}?c=" . rawurlencode($step['code'])
             . "&return=" . rawurlencode($next) . ($slow ? '&slow=1' : '');
 
         $jsUrl = json_encode($url, JSON_UNESCAPED_SLASHES);
@@ -630,17 +498,6 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
         header('Content-Type: text/html; charset=UTF-8');
 
         if (!$run || empty($run['steps']) || empty($run['home'])) {
-            if ($ret !== '' || $i > 0) {
-                error_log('[sMultisite SSO] RUN logout missing runId=' . $runId . ' i=' . $i . ' ret=' . $ret . ' host=' . ($_SERVER['HTTP_HOST'] ?? ''));
-                if ($ret !== '') {
-                    $jsRet = json_encode($ret, JSON_UNESCAPED_SLASHES);
-                    echo "<script>location.replace($jsRet);</script>";
-                    echo '<noscript><meta http-equiv="refresh" content="0;url=' . htmlspecialchars($ret, ENT_QUOTES) . '"></noscript>';
-                } else {
-                    echo "<h2>SMultisite SSO logout: Done ✔</h2><script>setTimeout(function(){window.close&&window.close();},400);</script>";
-                }
-                exit;
-            }
             echo "<h2>SMultisite SSO logout: Plan not found</h2>";
             exit;
         }
@@ -665,7 +522,7 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
         $next = "{$scheme}://{$home}/_ms-run-logout{$suffix}?run=" . rawurlencode($runId) . "&i=" . ($i + 1)
             . ($ret !== '' ? '&ret=' . rawurlencode($ret) : '')
             . ($slow ? '&slow=1' : '');
-        $url  = "{$scheme}://{$step['host']}/_ms-sso-logout{$suffix}?c=" . rawurlencode($step['code'])
+        $url  = "https://{$step['host']}/_ms-sso-logout{$suffix}?c=" . rawurlencode($step['code'])
             . "&return=" . rawurlencode($next) . ($slow ? '&slow=1' : '');
 
         $jsUrl = json_encode($url, JSON_UNESCAPED_SLASHES);
@@ -688,69 +545,19 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
 
         $err = null;
         $data = ms_sso_token_parse($code, $err);
-        if (!$data || ($data['mode'] ?? '') !== 'login' || (empty($data['sid']) && empty($data['uid']))) {
+        if (!$data || ($data['mode'] ?? '') !== 'login' || empty($data['sid'])) {
             error_log('[sMultisite SSO] RECEIVER login invalid token err=' . ($err ?? 'unknown') . ' host=' . ($_SERVER['HTTP_HOST'] ?? '') . ' sfm=' . ($_SERVER['HTTP_SEC_FETCH_MODE'] ?? ''));
             header('HTTP/1.1 400 Bad Request'); echo 'Invalid/expired'; exit;
         }
 
-        $canonHost = static function (string $h): string {
-            $h = trim($h);
-            $h = preg_replace('~^https?://~i', '', $h);
-            $h = rtrim($h, '/');
-            $parsedHost = parse_url('http://' . $h, PHP_URL_HOST);
-            if (is_string($parsedHost) && $parsedHost !== '') {
-                $h = $parsedHost;
-            }
-            return strtolower($h);
-        };
-        $tokenHost = $canonHost((string)($data['host'] ?? ''));
-        $currentHost = $canonHost((string)($_SERVER['HTTP_HOST'] ?? ''));
-        if ($tokenHost !== '' && $tokenHost !== $currentHost) {
-            error_log('[sMultisite SSO] RECEIVER login host mismatch token=' . $tokenHost . ' current=' . $currentHost);
-            header('HTTP/1.1 400 Bad Request'); echo 'Host mismatch'; exit;
-        }
-
-        $uid = (int)($data['uid'] ?? 0);
-        $didLocalLogin = false;
-        if ($uid > 0) {
-            try {
-                (new \EvolutionCMS\UserManager\Services\UserManager())->loginById([
-                    'id' => $uid,
-                    'context' => 'mgr',
-                ], false, false);
-                $didLocalLogin = true;
-            } catch (\Throwable $loginException) {
-                error_log('[sMultisite SSO] RECEIVER loginById failed uid=' . $uid . ' host=' . $currentHost . ' error=' . $loginException->getMessage());
-            }
-        }
-
-        $legacySid = $didLocalLogin
-            ? (string)session_id()
-            : (string)($data['sid_native'] ?? ($data['sid'] ?? ''));
-        $laravelSid = $didLocalLogin
-            ? ms_sso_current_session_id()
-            : (string)($data['sid'] ?? '');
-        if ($laravelSid === '') {
-            $laravelSid = $legacySid;
-        }
-        if ($legacySid === '') {
-            $legacySid = $laravelSid;
-        }
-        if ($legacySid === '' && $laravelSid === '') {
-            error_log('[sMultisite SSO] RECEIVER login empty sid host=' . $currentHost);
-            header('HTTP/1.1 400 Bad Request'); echo 'Missing sid'; exit;
-        }
-
         $noStore();
-        setcookie($cookie, $legacySid, array_merge($cookieOptionsBase, [
+        setcookie($cookie, $data['sid'], [
             'expires'  => 0,
-        ]));
-        if ($laravelCookie !== '' && $laravelCookie !== $cookie) {
-            setcookie($laravelCookie, $laravelSid, array_merge($cookieOptionsBase, [
-                'expires'  => 0,
-            ]));
-        }
-        error_log('[sMultisite SSO] RECEIVER login ok host=' . ($_SERVER['HTTP_HOST'] ?? '') . ' uid=' . $uid . ' local=' . ($didLocalLogin ? '1' : '0') . ' sid=' . $laravelSid . ' sid_native=' . $legacySid . ' return=' . $return);
+            'path'     => '/',
+            'secure'   => $https,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
 
         if ($slow) {
             header('Content-Type: text/html; charset=UTF-8');
@@ -776,21 +583,8 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
         }
 
         $noStore();
-        setcookie($cookie, '', array_merge($cookieOptionsBase, [
-            'expires'  => time() - 3600,
-        ]));
-        if ($laravelCookie !== '' && $laravelCookie !== $cookie) {
-            setcookie($laravelCookie, '', array_merge($cookieOptionsBase, [
-                'expires'  => time() - 3600,
-            ]));
-        }
-        if ($rootDom) {
-            setcookie($cookie, '', time() - 3600, '/', $rootDom, $sessionSecure, true);
-            if ($laravelCookie !== '' && $laravelCookie !== $cookie) {
-                setcookie($laravelCookie, '', time() - 3600, '/', $rootDom, $sessionSecure, true);
-            }
-        }
-        error_log('[sMultisite SSO] RECEIVER logout ok host=' . ($_SERVER['HTTP_HOST'] ?? '') . ' return=' . $return);
+        setcookie($cookie, '', time()-3600, '/', '', $https, true);
+        if ($rootDom) setcookie($cookie, '', time()-3600, '/', $rootDom, $https, true);
 
         if ($slow) {
             header('Content-Type: text/html; charset=UTF-8');
@@ -815,6 +609,7 @@ Event::listen('evolution.OnBeforeLoadDocumentObject', function () {
  * @return void
  */
 Event::listen('evolution.OnManagerTreePrerender', function($params) {
+    if (!Schema::hasTable('s_multisites')) return;
     $domain = \Seiger\sMultisite\Models\sMultisite::where('key', 'default')->first();
     if ($domain) {
         evo()->setConfig('site_key', $domain->key);
@@ -838,6 +633,7 @@ Event::listen('evolution.OnManagerTreePrerender', function($params) {
  * @return string|null HTML markup for extra roots, or null to keep default behavior
  */
 Event::listen('evolution.OnManagerTreeRender', function($params) {
+    if (!Schema::hasTable('s_multisites')) return;
     $tree = '';
     $_style = ManagerTheme::getStyle();
     $domains = \Seiger\sMultisite\Models\sMultisite::where('hide_from_tree', 0)->whereNot('key', 'default')->get();
@@ -874,6 +670,7 @@ Event::listen('evolution.OnManagerTreeRender', function($params) {
  * @return string|null Serialized placeholders, or null to keep default behavior
  */
 Event::listen('evolution.OnManagerNodePrerender', function($params) {
+    if (!Schema::hasTable('s_multisites')) return;
     $domains = \Seiger\sMultisite\Models\sMultisite::where('hide_from_tree', 0)->get();
     if ($domains) {
         $_style = ManagerTheme::getStyle();
@@ -928,6 +725,7 @@ Event::listen('evolution.OnManagerNodePrerender', function($params) {
  * @return string|null Blank string to hide, or null to keep default behavior
  */
 Event::listen('evolution.OnManagerNodeRender', function($params) {
+    if (!Schema::hasTable('s_multisites')) return;
     $domains = \Seiger\sMultisite\Models\sMultisite::all();
     if ($domains) {
         $multisiteResources = $domains->pluck('resource')->toArray();
