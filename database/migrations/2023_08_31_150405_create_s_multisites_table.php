@@ -38,13 +38,12 @@ class CreateSMultisitesTable extends Migration
             'site_start' => evo()->getConfig('site_start', 1),
             'error_page' => evo()->getConfig('error_page', 1),
             'unauthorized_page' => evo()->getConfig('unauthorized_page', 1),
+            'site_color' => '#60a5fa',
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s'),
         ];
 
-        $item = new \Seiger\sMultisite\Models\sMultisite();
-        foreach ($default as $key => $value) {
-            $item->{$key} = $value;
-        }
-        $item->save();
+        \Illuminate\Support\Facades\DB::table('s_multisites')->insert($default);
     }
 
     /**
