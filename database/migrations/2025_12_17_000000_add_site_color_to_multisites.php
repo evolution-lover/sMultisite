@@ -16,11 +16,9 @@ return new class extends Migration
      */
     public function up(): void
     {
-        if (Schema::hasTable('s_multisites')) {
+        if (Schema::hasTable('s_multisites') && !Schema::hasColumn('s_multisites', 'site_color')) {
             Schema::table('s_multisites', function (Blueprint $table) {
-                if (!Schema::hasColumn('s_multisites', 'site_color')) {
-                    $table->string('site_color', 50)->after('unauthorized_page')->default('#60a5fa');
-                }
+                $table->string('site_color', 50)->after('unauthorized_page')->default('#60a5fa');
             });
         }
     }
@@ -30,11 +28,9 @@ return new class extends Migration
      */
     public function down(): void
     {
-        if (Schema::hasTable('s_multisites')) {
+        if (Schema::hasTable('s_multisites') && Schema::hasColumn('s_multisites', 'site_color')) {
             Schema::table('s_multisites', function (Blueprint $table) {
-                if (Schema::hasColumn('s_multisites', 'site_color')) {
-                    $table->dropColumn('site_color');
-                }
+                $table->dropColumn('site_color');
             });
         }
     }
